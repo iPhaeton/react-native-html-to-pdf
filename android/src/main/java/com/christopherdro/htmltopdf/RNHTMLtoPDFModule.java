@@ -7,27 +7,83 @@ import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.bridge.ReadableArray;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.ByteArrayInputStream;
 import java.util.UUID;
+import java.util.HashSet;
+import java.util.Set;
+import java.nio.charset.Charset;
+
+import com.itextpdf.text.*;
+import com.itextpdf.tool.xml.*;
+import com.itextpdf.tool.xml.pipeline.*;
+import com.itextpdf.tool.xml.Tag;
+import com.itextpdf.text.Document;
+import com.itextpdf.text.pdf.PdfWriter;
+import com.itextpdf.text.pdf.codec.Base64;
+import com.itextpdf.tool.xml.XMLWorkerHelper;
+import com.itextpdf.text.FontFactory;
+import com.itextpdf.tool.xml.XMLWorkerFontProvider;
+import com.itextpdf.tool.xml.parser.XMLParser;
+import com.itextpdf.tool.xml.pipeline.css.CSSResolver;
+import com.itextpdf.tool.xml.pipeline.css.CssResolverPipeline;
+import com.itextpdf.tool.xml.pipeline.html.*;
+import com.itextpdf.tool.xml.pipeline.end.*;
+import com.itextpdf.tool.xml.pipeline.html.HtmlPipeline;
+import com.itextpdf.tool.xml.pipeline.html.HtmlPipelineContext;
+import com.itextpdf.text.BadElementException;
+import com.itextpdf.text.DocumentException;
+import com.itextpdf.text.Image;
+import com.itextpdf.text.pdf.codec.Base64;
+import com.itextpdf.tool.xml.html.Tags;
+import com.itextpdf.tool.xml.pipeline.html.AbstractImageProvider;
+
 
 import android.os.Environment;
-import android.print.PdfConverter;
 
 public class RNHTMLtoPDFModule extends ReactContextBaseJavaModule {
 
-    private static final String HTML = "html";
-    private static final String FILE_NAME = "fileName";
-    private static final String DIRECTORY = "directory";
-    private static final String BASE_64 = "base64";
-    private static final String BASE_URL = "baseURL";
 
-    private static final String PDF_EXTENSION = ".pdf";
-    private static final String PDF_PREFIX = "PDF_";
+  private Promise promise;
+  private final ReactApplicationContext mReactContext;
+  private Set<String> customFonts = new HashSet<>();
 
-    private final ReactApplicationContext mReactContext;
+  XMLWorkerFontProvider fontProvider = new XMLWorkerFontProvider(XMLWorkerFontProvider.DONTLOOKFORFONTS);
 
+  /**
+  * Code to get Base64,url or storage from tag o <img/>
+  * source : https://developers.itextpdf.com/ja/examples/xml-worker-itext5/html-images
+  * Editado por : Michael Vargas - Bucaramanga - Colombia
+  */
+  class Base64ImageProvider extends AbstractImageProvider {
+
+    @Override
+    public Image retrieve(String src) {
+      int pos = src.indexOf("base64,");
+      try {
+        if (src.startsWith("data") && pos > 0) {
+          byte[] img = Base64.decode(src.substring(pos + 7));
+          return Image.getInstance(img);
+        } else {
+          return Image.getInstance(src);
+        }
+      } catch (BadElementException ex) {
+        return null;
+      } catch (IOException ex) {
+        return null;
+      }
+    }
+
+    @Override
+    public String getImageRootPath() {
+      return null;
+    }
+  }
   public RNHTMLtoPDFModule(ReactApplicationContext reactContext) {
     super(reactContext);
     mReactContext = reactContext;
@@ -42,64 +98,99 @@ public class RNHTMLtoPDFModule extends ReactContextBaseJavaModule {
   public void convert(final ReadableMap options, final Promise promise) {
     try {
       File destinationFile;
-      String htmlString = options.hasKey(HTML) ? options.getString(HTML) : null;
-      if (htmlString == null) {
-        promise.reject(new Exception("RNHTMLtoPDF error: Invalid htmlString parameter."));
-        return;
-      }
+      String htmlString = options.hasKey("html") ? options.getString("html") : null;
+      if (htmlString == null) return;
 
       String fileName;
-      if (options.hasKey(FILE_NAME)) {
-        fileName = options.getString(FILE_NAME);
-        if (!isFileNameValid(fileName)) {
-          promise.reject(new Exception("RNHTMLtoPDF error: Invalid fileName parameter."));
-          return;
-        }
+      if (options.hasKey("fileName")) {
+        fileName = options.getString("fileName");
       } else {
-        fileName = PDF_PREFIX + UUID.randomUUID().toString();
+        fileName = UUID.randomUUID().toString();
       }
 
-      if (options.hasKey(DIRECTORY)) {
-        String state = Environment.getExternalStorageState();
-        File path = (Environment.MEDIA_MOUNTED.equals(state)) ?
-          new File(Environment.getExternalStorageDirectory(), options.getString(DIRECTORY)) :
-          new File(mReactContext.getFilesDir(), options.getString(DIRECTORY));
-
-        if (!path.exists()) {
-          if (!path.mkdirs()) {
-            promise.reject(new Exception("RNHTMLtoPDF error: Could not create folder structure."));
-            return;
+      if (options.hasKey("fonts")) {
+        if (options.getArray("fonts") != null) {
+          final ReadableArray fonts = options.getArray("fonts");
+          for (int i = 0; i < fonts.size(); i++) {
+            customFonts.add(fonts.getString(i));
           }
         }
-        destinationFile = new File(path, fileName + PDF_EXTENSION);
+      }
+
+      if (options.hasKey("directory") && options.getString("directory").equals("docs")) {
+        String state = Environment.getExternalStorageState();
+          File path = (Environment.MEDIA_MOUNTED.equals(state)) ?
+                  new File(Environment.getExternalStorageDirectory(), Environment.DIRECTORY_DOCUMENTS)
+                  : new File(mReactContext.getFilesDir(), Environment.DIRECTORY_DOCUMENTS);
+
+        if (!path.exists()) path.mkdir();
+        destinationFile = new File(path, fileName + ".pdf");
       } else {
         destinationFile = getTempFile(fileName);
       }
 
-      convertToPDF(htmlString,
-              destinationFile,
-              options.hasKey(BASE_64) && options.getBoolean(BASE_64),
-              Arguments.createMap(),
-              promise,
-              options.hasKey(BASE_URL) ? options.getString(BASE_URL) : null);
+      String filePath = convertToPDF(htmlString, destinationFile);
+      String base64 = "";
+
+      if (options.hasKey("base64") && options.getBoolean("base64") == true) {
+        base64 = Base64.encodeFromFile(filePath);
+      }
+
+      WritableMap resultMap = Arguments.createMap();
+      resultMap.putString("filePath", filePath);
+      resultMap.putString("base64", base64);
+
+      promise.resolve(resultMap);
     } catch (Exception e) {
-      promise.reject(e);
+      promise.reject(e.getMessage());
+    }
+  }
+  private String convertToPDF(String htmlString, File file) throws Exception {
+    try {
+      Document document = new Document();
+      PdfWriter pdfWriter = PdfWriter.getInstance(document, new FileOutputStream(file));
+
+      FontFactory.setFontImp(fontProvider);
+      for (String font : customFonts) {
+        fontProvider.register(font);
+      }
+
+      document.open();
+      document.add(new Chunk("")); // This prevent empty document exception
+
+      CSSResolver cssResolver =
+              XMLWorkerHelper.getInstance().getDefaultCssResolver(true);
+
+      HtmlPipelineContext htmlContext = new HtmlPipelineContext(null);
+      htmlContext.setTagFactory(Tags.getHtmlTagProcessorFactory());
+      htmlContext.setImageProvider(new Base64ImageProvider());
+      
+      PdfWriterPipeline pdfWriterPipeline = new PdfWriterPipeline(document, pdfWriter);
+      HtmlPipeline html = new HtmlPipeline(htmlContext, pdfWriterPipeline);
+      CssResolverPipeline css = new CssResolverPipeline(cssResolver, html);
+
+      XMLWorker xmlWorker = new XMLWorker(css, true);
+      XMLParser xmlParser = new XMLParser(xmlWorker);
+      xmlParser.parse(new ByteArrayInputStream(htmlString.getBytes()));
+      document.close();
+
+      String absolutePath = file.getAbsolutePath();
+      return absolutePath;
+    } catch (Exception e) {
+      throw new Exception(e);
     }
   }
 
-  private void convertToPDF(String htmlString, File file, boolean shouldEncode, WritableMap resultMap, Promise promise,
-      String baseURL) throws Exception {
-      PdfConverter.getInstance().convert(mReactContext, htmlString, file, shouldEncode, resultMap, promise, baseURL);
-  }
-
-  private File getTempFile(String fileName) throws IOException {
+  private File getTempFile(String fileName) throws Exception {
+    try {
       File outputDir = getReactApplicationContext().getCacheDir();
-      return File.createTempFile(fileName, PDF_EXTENSION, outputDir);
+      File outputFile = File.createTempFile("PDF_" + UUID.randomUUID().toString(), ".pdf", outputDir);
 
+      return outputFile;
+
+    } catch (Exception e) {
+      throw new Exception(e);
+    }
   }
 
-  private boolean isFileNameValid(String fileName) throws Exception {
-    return new File(fileName).getCanonicalFile().getName().equals(fileName);
-  }
 }
-
